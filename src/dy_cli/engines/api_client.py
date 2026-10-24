@@ -8,14 +8,17 @@ Douyin API Client — 逆向 API 采集客户端。
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import random
 import re
 import time
+import uuid
 from collections.abc import Callable
 from typing import Any
+from urllib.parse import urlencode
 
 import httpx
 
@@ -172,6 +175,44 @@ class DouyinAPIClient:
             )
         except Exception:
             pass
+
+    # ------------------------------------------------------------------
+    # x-secsdk-web-signature（detail 端点 2026-09 新增校验，
+    # 算法与 yt-dlp PR #17826 对齐：MD5(uifid_timestamp_salt_query)）
+    # ------------------------------------------------------------------
+
+    _SEC_SALT = "A96D855A08C0A9707F8BEF0D9A527E4E"
+    _WEB_AID = 6383
+
+    def _ensure_secsdk_cookies(self) -> None:
+        """detail 端点要求 ttwid + passport_csrf_token（后者任意值即可）。"""
+        jar = self.client.cookies
+        if not jar.get("passport_csrf_token"):
+            jar.set("passport_csrf_token", uuid.uuid4().hex, domain=".douyin.com")
+
+    def _get_uifid(self) -> str:
+        """uifid：cookie 里有就用；没有则请求首页，从 x-tt-trace-host 响应头取。"""
+        jar = self.client.cookies
+        for name in ("uifid", "uifid_temp", "UIFID", "UIFID_TEMP"):
+            value = jar.get(name)
+            if value:
+                return value
+        try:
+            resp = self.client.get("https://www.douyin.com/")
+            return resp.headers.get("x-tt-trace-host") or ""
+        except Exception:
+            return ""
+
+    def _secsdk_sign(self, params: dict[str, Any]) -> dict[str, Any]:
+        """为 query 附加 uifid / timestamp / x-secsdk-web-signature。"""
+        uifid = self._get_uifid()
+        timestamp = str(int(time.time()))
+        query = {**params, "uifid": uifid, "timestamp": timestamp}
+        encoded = urlencode(query)
+        signature = hashlib.md5(
+            f"{uifid}_{timestamp}_{self._SEC_SALT}_{encoded}".encode()
+        ).hexdigest()
+        return {**query, "x-secsdk-web-signature": signature}
 
     # ------------------------------------------------------------------
     # Rate limiting & anti-detection
@@ -472,10 +513,15 @@ class DouyinAPIClient:
         # Primary: Web API
         try:
             params = {
-                **get_base_params(),
+                # detail 端点只接受极简参数集（设备参数/msToken 反而触发 403，
+                # 与 yt-dlp PR #17826 的最小可行请求一致）
                 "aweme_id": aweme_id,
+                "aid": self._WEB_AID,
             }
-            data = self._get(VIDEO_DETAIL_URL, params=params)
+            # 2026-09 起 detail 端点要求 x-secsdk-web-signature（算法与
+            # yt-dlp PR #17826 对齐），旧 X-Bogus 签名会被判空数据。
+            self._ensure_secsdk_cookies()
+            data = self._get(VIDEO_DETAIL_URL, params=self._secsdk_sign(params))
             if data.get("status_code") == 0:
                 aweme_detail = data.get("aweme_detail", {})
                 if aweme_detail:
